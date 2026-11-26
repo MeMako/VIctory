@@ -1057,6 +1057,110 @@ pub(crate) mod tests {
         crate::watch::tests::free(memory);
     }
 
+    /// Sync a full 16-page batch (32,768 slots), with records on both sides
+    /// of every page boundary and the split between the two diff workers.
+    #[cfg(windows)]
+    #[test]
+    fn a_sixteen_page_heap_sync_preserves_sparse_views_at_the_boundaries() {
+        use crate::watch::{
+            PAGE,
+            tests::{free, pool},
+        };
+        use windows::Win32::Graphics::Direct3D12::D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+
+        if crate::host::host().is_none() {
+            eprintln!("skipping 16-page descriptor sync: no host D3D12 device");
+            return;
+        }
+        const PAGES: usize = 16;
+        const SLOTS: usize = PAGE / 32;
+        let memory = pool(PAGES);
+        let buffer = pool(1);
+        let desc = HeapDesc {
+            kind: VIEWS_KIND,
+            count: (PAGES * SLOTS) as u32,
+            flags: SHADER_VISIBLE,
+            nodes: 1,
+        };
+        let placement = Placement {
+            address: memory as u64,
+            size: (PAGES * PAGE) as u64,
+        };
+        let mut h = std::ptr::null();
+        assert_eq!(create(desc, placement, &mut h), S_OK);
+        let host = heap(h).host().expect("a host view heap");
+        assert!(heap(h).written.is_some());
+        assert!(host.view_addresses().is_some());
+        crate::shadow::register(buffer, buffer as u64, PAGE as u64);
+
+        // Make the records outside the heap. Only copying their bytes into the
+        // write-watched pages will cause the production sync to mirror them.
+        let address = |page: usize, pass: usize| (buffer + 256 * (2 * page + pass)) as u64;
+        let record = |address: u64| {
+            let mut resource = [0; 14];
+            (resource[0], resource[4]) = (1, 64);
+            let mut view = [0; 16];
+            (view[1], view[2], view[6], view[7]) =
+                (1, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, 16, 4);
+            (view[10], view[11]) = (address as u32, (address >> 32) as u32);
+            let mut words = [0u32; 8];
+            create_placed_srv(
+                std::ptr::null(),
+                &resource,
+                &view,
+                words.as_mut_ptr() as u64,
+            );
+            words
+        };
+        for pass in 0..2 {
+            let records: Vec<_> = (0..PAGES).map(|page| record(address(page, pass))).collect();
+            {
+                // A concurrent submission must not scan the batch halfway through these writes.
+                let _heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+                for (page, &words) in records.iter().enumerate() {
+                    let first = page * SLOTS;
+                    let write = |slot: usize, words: [u32; 8]| {
+                        // SAFETY: a full 32-byte slot in our registered, page-aligned heap.
+                        unsafe { ((memory as *mut [u32; 8]).add(slot)).write(words) };
+                    };
+                    write(first, words);
+                    if pass == 0 {
+                        write(first + 1, words);
+                        write(first + SLOTS - 1, words);
+                    } else {
+                        write(first + SLOTS - 1, [0; 8]);
+                    }
+                }
+            }
+            sync_heaps();
+            for page in 0..PAGES {
+                let first = page * SLOTS;
+                let old = address(page, 0);
+                for (slot, want) in [
+                    (first, address(page, pass)),
+                    (first + 1, old),
+                    (first + 2, 0),
+                    (first + SLOTS - 1, if pass == 0 { old } else { 0 }),
+                ] {
+                    assert_eq!(
+                        host.address_at(slot as u32),
+                        Some(want),
+                        "pass {pass}, slot {slot}"
+                    );
+                    assert_eq!(
+                        host.kept(slot as u32),
+                        want != 0,
+                        "pass {pass}, slot {slot}"
+                    );
+                }
+            }
+        }
+        release(h);
+        crate::shadow::unregister(buffer, buffer as u64);
+        free(buffer);
+        free(memory);
+    }
+
     /// Grand Theft Auto VI places its shader-visible heap in its own memory
     /// and checks that the heap starts there.
     #[test]

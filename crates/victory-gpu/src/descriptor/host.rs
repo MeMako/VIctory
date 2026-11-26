@@ -609,7 +609,7 @@ impl HostHeap {
     /// The view address entered for slot `index`; none for a slot past the
     /// view addresses' buffer (tests).
     #[cfg(test)]
-    fn address_at(&self, index: u32) -> Option<u64> {
+    pub(super) fn address_at(&self, index: u32) -> Option<u64> {
         let (buffer, data, _) = self.addresses.get()?.as_ref()?;
         // SAFETY: a live buffer.
         if 16 * u64::from(index) + 16 > unsafe { buffer.GetDesc() }.Width {
