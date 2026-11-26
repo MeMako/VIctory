@@ -178,24 +178,68 @@ pub(crate) fn sync_heaps() {
             continue;
         };
         let step = u64::from(step);
+        let page_size = crate::watch::PAGE;
+        let mut pages: Vec<(usize, usize)> = Vec::new();
         for (from, to) in written.take(start as usize, usize::MAX) {
             // By page: one with nothing mapped (the title unmaps heap pages
             // too) holds no records.
-            let page_size = crate::watch::PAGE;
             for page in (from & !(page_size - 1)..to).step_by(page_size) {
-                let (page, end) = (page.max(from), (page + page_size).min(to));
-                if !crate::host::read_into(page as *const u8, &mut [0u8; 4]) {
-                    continue;
-                }
-                let (first, last) = ((page as u64 - start) / step, (end as u64 - start).div_ceil(step));
-                #[cfg(feature = "diagnostics")]
-                crate::copystat::add(
-                    crate::copystat::C::SyncSlots,
-                    last.min(u64::from(heap.desc.count)).saturating_sub(first),
-                );
-                host.sync_slots(first as u32, last.min(u64::from(heap.desc.count)) as u32, start, step);
+                pages.push((page.max(from), (page + page_size).min(to)));
             }
         }
+        if pages.is_empty() {
+            continue;
+        }
+        let mut mapped = vec![false; pages.len()];
+        if pages.len() >= 16 {
+            let workers = std::thread::available_parallelism()
+                .map_or(4, |n| n.get() / 2)
+                .clamp(2, 6)
+                .min(pages.len().div_ceil(8));
+            let chunk = pages.len().div_ceil(workers);
+            std::thread::scope(|scope| {
+                for (p_chunk, m_chunk) in pages.chunks(chunk).zip(mapped.chunks_mut(chunk)) {
+                    scope.spawn(move || {
+                        for (&(page, _), ok) in p_chunk.iter().zip(m_chunk.iter_mut()) {
+                            *ok = crate::host::read_into(page as *const u8, &mut [0u8; 4]);
+                        }
+                    });
+                }
+            });
+        } else {
+            for (&(page, _), ok) in pages.iter().zip(mapped.iter_mut()) {
+                *ok = crate::host::read_into(page as *const u8, &mut [0u8; 4]);
+            }
+        }
+        let limit = u64::from(heap.desc.count);
+        let mut ranges: Vec<(u32, u32)> = Vec::new();
+        for (&(page, end), &ok) in pages.iter().zip(&mapped) {
+            if !ok {
+                continue;
+            }
+            let first = ((page as u64 - start) / step).min(limit) as u32;
+            let last = (end as u64 - start).div_ceil(step).min(limit) as u32;
+            if first < last {
+                ranges.push((first, last));
+            }
+        }
+        if ranges.is_empty() {
+            continue;
+        }
+        ranges.sort_unstable();
+        let mut merged: Vec<(u32, u32)> = Vec::with_capacity(ranges.len());
+        for (a, b) in ranges {
+            match merged.last_mut() {
+                Some(last) if a <= last.1 => last.1 = last.1.max(b),
+                _ => merged.push((a, b)),
+            }
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            let total: u64 = merged.iter().map(|&(a, b)| u64::from(b - a)).sum();
+            crate::copystat::add(crate::copystat::C::SyncSlots, total);
+        }
+        host.sync_ranges(&merged, start, step);
     }
 }
 
@@ -542,16 +586,11 @@ fn view_at(i: u32, generation: u32) -> Option<View> {
     (*current == generation).then(|| view.clone())
 }
 
-/// For each record (tag, index, generation): whether it names a view that
-/// is current, as [`view_at`] would find it (one lock for them all).
-fn views_current(records: &[[u32; 3]]) -> Vec<bool> {
+/// Runs `f` with the recorded views table (`VIEWS`) locked once.
+#[cfg(windows)]
+fn with_views<R>(f: impl FnOnce(&[(View, u32)]) -> R) -> R {
     let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
-    records
-        .iter()
-        .map(|&[tag, i, generation]| {
-            tag == VIEW_TAG && views.list.get(i as usize).is_some_and(|(_, current)| *current == generation)
-        })
-        .collect()
+    f(&views.list)
 }
 
 /// The view recorded at `handle`, if one is (and its resource is alive).

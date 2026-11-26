@@ -1092,6 +1092,55 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
 /// culled). Such a view gets a copy of its own bytes, starting at its
 /// address (`true` with it), which lives while a heap slot made from the
 /// view or a list holds it.
+/// Resolves existing host copies for many `(address, len)` queries under one
+/// `BUFFERS` lock, returning `None` for any query that needs a copy created on
+/// first use or falls in loose memory (the caller falls back to [`find`]).
+pub(crate) fn find_existing_batch(queries: &[(u64, u64)]) -> Vec<Option<Arc<Shadow>>> {
+    let mut out = vec![None; queries.len()];
+    if queries.is_empty() {
+        return out;
+    }
+    let map = buffers();
+    // Small MRU cache of `(start, end, next_key_start, shadow)`: any query
+    // with `start <= address < next_key_start && end <= entry_end` is
+    // guaranteed to hit the same innermost `BUFFERS` entry.
+    let mut mru: [(u64, u64, u64, Option<Arc<Shadow>>); 4] = [const { (0, 0, 0, None) }; 4];
+    let mut mru_next = 0usize;
+    for (&(address, len), slot) in queries.iter().zip(out.iter_mut()) {
+        let Some(end) = address.checked_add(len.max(1)) else {
+            continue;
+        };
+        if let Some((_, _, _, Some(s))) = mru
+            .iter()
+            .find(|(s, e, next, sh)| sh.is_some() && address >= *s && address < *next && end <= *e)
+        {
+            *slot = Some(s.clone());
+            continue;
+        }
+        let found = map
+            .range(..=(address, usize::MAX))
+            .rev()
+            .take(64)
+            .find(|(_, e)| e.end >= end);
+        let Some((&key, entry)) = found else {
+            continue;
+        };
+        let Some(shadow) = &entry.shadow else {
+            continue;
+        };
+        let next_start = map
+            .range((std::ops::Bound::Excluded(key), std::ops::Bound::Unbounded))
+            .next()
+            .map_or(u64::MAX, |(k, _)| k.0);
+        if next_start > key.0 {
+            mru[mru_next] = (key.0, entry.end, next_start, Some(shadow.clone()));
+            mru_next = (mru_next + 1) & 3;
+        }
+        *slot = Some(shadow.clone());
+    }
+    out
+}
+
 pub(crate) fn for_view(address: u64, len: u64, element: u64) -> Option<(Arc<Shadow>, bool)> {
     let shadow = find(address, len)?;
     if element == 0 || shadow.offset(address).is_multiple_of(element) {
@@ -1656,5 +1705,82 @@ pub(crate) mod tests {
         assert_eq!(m.take(5), Some(0));
         assert_eq!(pages(0x1_fff0, 0x20), 2, "a range across a page boundary");
         assert_eq!(pages(0x2_0000, 0x1_0000), 1);
+    }
+
+    /// `find_existing_batch` (and its MRU cache) returns the exact same
+    /// innermost host copy as `find` across outer, nested inner, boundary-
+    /// crossing, adjacent, uncreated, and unmapped ranges.
+    #[test]
+    fn find_existing_batch_matches_find_for_nested_and_adjacent_buffers() {
+        let pool = crate::watch::tests::pool(7);
+        let base = pool as u64;
+        let outer_id = pool;
+        let inner_id = pool + 1;
+        let adj_id = pool + 2;
+        let uncreated_id = pool + 3;
+
+        let p = PAGE as u64;
+        register(outer_id, base, 4 * p);
+        register(inner_id, base + p, p);
+        register(adj_id, base + 4 * p, p);
+        register(uncreated_id, base + 6 * p, p);
+
+        let Some(outer) = find(base, 64) else {
+            unregister(outer_id, base);
+            unregister(inner_id, base + p);
+            unregister(adj_id, base + 4 * p);
+            unregister(uncreated_id, base + 6 * p);
+            return; // no host GPU here
+        };
+        let inner = find(base + p, 64).expect("inner copy");
+        let adj = find(base + 4 * p, 64).expect("adjacent copy");
+        assert!(!Arc::ptr_eq(&outer, &inner));
+        assert!(!Arc::ptr_eq(&outer, &adj));
+
+        // Queries designed to stress MRU hits, MRU misses past `next_key_start`,
+        // boundary spans from outer across inner, adjacent buffer, gap, and
+        // registered-but-uncreated buffer.
+        let queries = [
+            (base, 64),                  // outer (fills MRU)
+            (base + 128, 64),            // outer (MRU hit before inner)
+            (base + p, 64),              // inner (nested inside outer)
+            (base + p + 128, 64),        // inner (MRU hit)
+            (base + p - 32, 64),         // crosses outer -> inner start: must be outer
+            (base + 2 * p, 64),          // outer past inner: must NOT return inner
+            (base + 3 * p + 64, 64),     // outer near end
+            (base + 4 * p, 64),          // adjacent buffer
+            (base + 4 * p + 128, 64),    // adjacent buffer (MRU hit)
+            (base + 5 * p, 64),          // gap (not in BUFFERS -> None)
+            (base + 6 * p, 64),          // registered but shadow not yet created -> None
+        ];
+        let got = find_existing_batch(&queries);
+        assert_eq!(got.len(), queries.len());
+        let same = |a: &Option<Arc<Shadow>>, b: &Arc<Shadow>| {
+            a.as_ref().is_some_and(|s| Arc::ptr_eq(s, b))
+        };
+        assert!(same(&got[0], &outer), "q0 outer");
+        assert!(same(&got[1], &outer), "q1 outer mru");
+        assert!(same(&got[2], &inner), "q2 inner");
+        assert!(same(&got[3], &inner), "q3 inner mru");
+        assert!(same(&got[4], &outer), "q4 boundary crosses into inner -> outer");
+        assert!(same(&got[5], &outer), "q5 outer past inner");
+        assert!(same(&got[6], &outer), "q6 outer tail");
+        assert!(same(&got[7], &adj), "q7 adjacent");
+        assert!(same(&got[8], &adj), "q8 adjacent mru");
+        assert!(got[9].is_none(), "q9 unmapped gap");
+        assert!(got[10].is_none(), "q10 uncreated shadow defers to find()");
+
+        // Verify every `Some` result matches `find()` identically.
+        for (&(addr, len), res) in queries.iter().zip(&got) {
+            if let Some(s) = res {
+                let expected = find(addr, len).expect("find must match");
+                assert!(Arc::ptr_eq(s, &expected), "mismatch at {addr:#x}+{len:#x}");
+            }
+        }
+
+        unregister(outer_id, base);
+        unregister(inner_id, base + p);
+        unregister(adj_id, base + 4 * p);
+        unregister(uncreated_id, base + 6 * p);
     }
 }

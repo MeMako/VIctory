@@ -3684,6 +3684,14 @@ pub(crate) fn retire(resource: ID3D12Resource) {
     RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push(resource);
 }
 
+/// [`retire`] for many resources under one lock.
+pub(crate) fn retire_all(resources: impl IntoIterator<Item = ID3D12Resource>) {
+    let mut iter = resources.into_iter().peekable();
+    if iter.peek().is_some() {
+        RETIRED.lock().unwrap_or_else(|e| e.into_inner()).extend(iter);
+    }
+}
+
 /// After a submission has run, with none running: the retired resources go.
 pub(crate) fn release_retired() {
     let retired = std::mem::take(&mut *RETIRED.lock().unwrap_or_else(|e| e.into_inner()));
